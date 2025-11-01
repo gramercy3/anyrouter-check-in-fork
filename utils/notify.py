@@ -5,6 +5,7 @@ from email.mime.text import MIMEText
 from typing import Literal
 
 import httpx
+import traceback
 
 
 class NotificationKit:
@@ -87,66 +88,96 @@ class NotificationKit:
 		if not self.telegram_bot_token or not self.telegram_chat_id:
 			raise ValueError('Telegram Bot Token or Chat ID not configured')
 
-		# 支援表格格式：將內容解析為等寬欄位並以 <pre> 呈現
-		use_table = os.getenv('TELEGRAM_FORMAT', '').lower() == 'table'
+		# 支援表格格式：未設定時自動偵測是否包含餘額資訊
+		fmt = os.getenv('TELEGRAM_FORMAT', '').lower()
 		message = f'<b>{title}</b>\n\n{content}'
+		auto_table = any(
+			line.strip().startswith('[BALANCE]') or re.search(r'Current balance: \$[0-9.]+, Used: \$[0-9.]+', line)
+			for line in content.splitlines()
+		)
+		use_table = True if fmt == 'table' else False if fmt == 'plain' else auto_table
 		if use_table:
-			lines = content.splitlines()
-			rows: list[tuple[str, str, str, str]] = []  # (account, status, balance, used)
-			time_line = ''
-			for i, line in enumerate(lines):
-				line = line.strip()
-				if line.startswith('[TIME] '):
-					time_line = line
-				elif line.startswith('[SUCCESS]') or line.startswith('[FAIL]') or line.startswith('[BALANCE]'):
-					# 解析狀態與帳號名稱
-					try:
-						status_end = line.index(']')
-						status = line[1:status_end]
-						account = line[status_end + 1 :].strip()
-					except Exception:
-						status = 'INFO'
-						account = line
+				lines = content.splitlines()
+				rows: list[tuple[str, str, str]] = []  # (account, balance, used)
+				consumed_balance_line: set[int] = set()
+				for i, line in enumerate(lines):
+					line = line.strip()
+					if line.startswith('[SUCCESS]') or line.startswith('[FAIL]') or line.startswith('[BALANCE]'):
+						# 解析帳號名稱（去除前導標籤）
+						try:
+							status_end = line.index(']')
+							account = line[status_end + 1 :].strip()
+						except Exception:
+							account = line
 
-					# 嘗試解析下一行的餘額與用量
-					bal = '-'
-					used = '-'
-					if i + 1 < len(lines):
-						m = re.search(r'Current balance: \$([0-9.]+), Used: \$([0-9.]+)', lines[i + 1])
-						if m:
-							bal = m.group(1)
-							used = m.group(2)
+						# 嘗試解析下一行的餘額與用量
+						bal = '-'
+						used = '-'
+						if i + 1 < len(lines):
+							m = re.search(r'Current balance: \$([0-9.]+), Used: \$([0-9.]+)', lines[i + 1])
+							if m:
+								bal = m.group(1)
+								used = m.group(2)
+								consumed_balance_line.add(i + 1)
 
-					rows.append((account, status, bal, used))
+						rows.append((account, bal, used))
 
-			if rows:
-				headers = ('帳號', '狀態', '餘額($)', '已用($)')
-				widths = [len(h) for h in headers]
-				for acc, st, bal, usd in rows:
-					widths[0] = max(widths[0], len(str(acc)))
-					widths[1] = max(widths[1], len(str(st)))
-					widths[2] = max(widths[2], len(str(bal)))
-					widths[3] = max(widths[3], len(str(usd)))
+				# 建立非表格文字：保留其他行（包含 [TIME]、統計等），排除帳號行與已消耗的餘額行
+				non_table_lines: list[str] = []
+				for j, ln in enumerate(lines):
+					if j in consumed_balance_line:
+						continue
+					if ln.strip().startswith('[SUCCESS]') or ln.strip().startswith('[FAIL]') or ln.strip().startswith('[BALANCE]'):
+						continue
+					non_table_lines.append(ln)
+				non_table_text = '\n'.join(non_table_lines).strip()
 
-				def fmt(row: tuple[str, str, str, str]) -> str:
-					return (
-						str(row[0]).ljust(widths[0])
-						+ '  '
-						+ str(row[1]).ljust(widths[1])
-						+ '  '
-						+ str(row[2]).rjust(widths[2])
-						+ '  '
-						+ str(row[3]).rjust(widths[3])
-					)
+				if rows:
+					headers = ('帳號', '餘額($)', '已用($)')
+					widths = [len(h) for h in headers]
+					for acc, bal, usd in rows:
+						widths[0] = max(widths[0], len(str(acc)))
+						widths[1] = max(widths[1], len(str(bal)))
+						widths[2] = max(widths[2], len(str(usd)))
 
-				head = fmt(headers)  # type: ignore[arg-type]
-				body = '\n'.join(fmt(r) for r in rows)
-				prefix = f'{time_line}\n\n' if time_line else ''
-				message = f'<b>{title}</b>\n\n<pre>{prefix}{head}\n{body}</pre>'
+					def fmt(row: tuple[str, str, str]) -> str:
+						return (
+							str(row[0]).ljust(widths[0])
+							+ '  '
+							+ str(row[1]).rjust(widths[1])
+							+ '  '
+							+ str(row[2]).rjust(widths[2])
+						)
+
+					head = fmt(headers)  # type: ignore[arg-type]
+					body = '\n'.join(fmt(r) for r in rows)
+					if non_table_text:
+						message = f'<b>{title}</b>\n\n{non_table_text}\n\n<pre>{head}\n{body}</pre>'
+					else:
+						message = f'<b>{title}</b>\n\n<pre>{head}\n{body}</pre>'
 		data = {'chat_id': self.telegram_chat_id, 'text': message, 'parse_mode': 'HTML'}
 		url = f'https://api.telegram.org/bot{self.telegram_bot_token}/sendMessage'
 		with httpx.Client(timeout=30.0) as client:
-			client.post(url, json=data)
+			resp = client.post(url, json=data)
+			# 詳細錯誤輸出：HTTP 狀態與 API 錯誤描述
+			if resp.status_code != 200:
+				api_desc = ''
+				try:
+					payload = resp.json()
+					api_desc = f" error_code={payload.get('error_code')}, description={payload.get('description')}"
+				except Exception:
+					api_desc = f' body={resp.text[:200]}'
+				raise RuntimeError(f'Telegram HTTP {resp.status_code}.{api_desc}')
+
+			try:
+				payload = resp.json()
+			except Exception:
+				raise RuntimeError(f'Telegram invalid JSON response: {resp.text[:200]}')
+
+			if not payload.get('ok', True):
+				raise RuntimeError(
+					f"Telegram API error: error_code={payload.get('error_code')}, description={payload.get('description')}"
+				)
 
 	def push_message(self, title: str, content: str, msg_type: Literal['text', 'html'] = 'text'):
 		notifications = [
@@ -164,7 +195,11 @@ class NotificationKit:
 				func()
 				print(f'[{name}]: Message push successful!')
 			except Exception as e:
-				print(f'[{name}]: Message push failed! Reason: {str(e)}')
+				debug = os.getenv('NOTIFY_DEBUG', '').lower() == 'true'
+				msg = f'[{name}]: Message push failed! Reason: {e.__class__.__name__}: {str(e)}'
+				if debug:
+					msg += f"\n{traceback.format_exc()}"
+				print(msg)
 
 
 notify = NotificationKit()

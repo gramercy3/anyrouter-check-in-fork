@@ -287,6 +287,7 @@ async def main():
 	current_balances = {}
 	need_notify = False  # 是否需要发送通知
 	balance_changed = False  # 余额是否有变化
+	all_results: list[tuple[str, bool, dict | None]] = []  # (name, success, user_info)
 
 	for i, account in enumerate(accounts):
 		account_key = f'account_{i + 1}'
@@ -318,11 +319,19 @@ async def main():
 					account_result += f'\n{user_info.get("error", "Unknown error")}'
 				notification_content.append(account_result)
 
-		except Exception as e:
+			except Exception as e:
 			account_name = account.get_display_name(i)
 			print(f'[FAILED] {account_name} processing exception: {e}')
 			need_notify = True  # 异常也需要通知
 			notification_content.append(f'[FAIL] {account_name} exception: {str(e)[:50]}...')
+
+		finally:
+			# 记录每个账号的结果用于在手动触发时推送摘要
+			try:
+				account_name = account.get_display_name(i)
+				all_results.append((account_name, success, user_info))
+			except Exception:
+				pass
 
 	# 检查余额变化
 	current_balance_hash = generate_balance_hash(current_balances) if current_balances else None
@@ -356,6 +365,17 @@ async def main():
 	# 保存当前余额hash
 	if current_balance_hash:
 		save_balance_hash(current_balance_hash)
+
+	# 手动触发（workflow_dispatch）或显式设置 ALWAYS_NOTIFY 时强制推送
+	always_notify = os.getenv('ALWAYS_NOTIFY', '').lower() == 'true' or os.getenv('GITHUB_EVENT_NAME', '') == 'workflow_dispatch'
+	if always_notify and not notification_content:
+		for name, succ, info in all_results:
+			status = '[SUCCESS]' if succ else '[FAIL]'
+			msg = f'{status} {name}'
+			if info and info.get('success'):
+				msg += f"\n{info['display']}"
+			notification_content.append(msg)
+		need_notify = True
 
 	if need_notify and notification_content:
 		# 构建通知内容
