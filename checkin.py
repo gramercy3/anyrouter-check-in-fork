@@ -35,11 +35,8 @@ def load_balance_hash():
 
 def save_balance_hash(balance_hash):
 	"""保存余额hash"""
-	try:
-		with open(BALANCE_HASH_FILE, 'w', encoding='utf-8') as f:
-			f.write(balance_hash)
-	except Exception as e:
-		print(f'Warning: Failed to save balance hash: {e}')
+	with open(BALANCE_HASH_FILE, 'w', encoding='utf-8') as f:
+		f.write(balance_hash)
 
 
 def generate_balance_hash(balances):
@@ -291,15 +288,15 @@ async def main():
 
 	for i, account in enumerate(accounts):
 		account_key = f'account_{i + 1}'
+		success = False
+		user_info = None
 		try:
 			success, user_info = await check_in_account(account, i, app_config)
 			if success:
 				success_count += 1
 
-			should_notify_this_account = False
-
+			should_notify_this_account = not success
 			if not success:
-				should_notify_this_account = True
 				need_notify = True
 				account_name = account.get_display_name(i)
 				print(f'[NOTIFY] {account_name} failed, will send notification')
@@ -318,13 +315,11 @@ async def main():
 				elif user_info:
 					account_result += f'\n{user_info.get("error", "Unknown error")}'
 				notification_content.append(account_result)
-
-			except Exception as e:
+		except Exception as e:
 			account_name = account.get_display_name(i)
 			print(f'[FAILED] {account_name} processing exception: {e}')
 			need_notify = True  # 异常也需要通知
 			notification_content.append(f'[FAIL] {account_name} exception: {str(e)[:50]}...')
-
 		finally:
 			# 记录每个账号的结果用于在手动触发时推送摘要
 			try:
