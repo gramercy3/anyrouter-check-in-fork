@@ -1,4 +1,5 @@
 import os
+import re
 import smtplib
 from email.mime.text import MIMEText
 from typing import Literal
@@ -86,7 +87,62 @@ class NotificationKit:
 		if not self.telegram_bot_token or not self.telegram_chat_id:
 			raise ValueError('Telegram Bot Token or Chat ID not configured')
 
+		# 支援表格格式：將內容解析為等寬欄位並以 <pre> 呈現
+		use_table = os.getenv('TELEGRAM_FORMAT', '').lower() == 'table'
 		message = f'<b>{title}</b>\n\n{content}'
+		if use_table:
+			lines = content.splitlines()
+			rows: list[tuple[str, str, str, str]] = []  # (account, status, balance, used)
+			time_line = ''
+			for i, line in enumerate(lines):
+				line = line.strip()
+				if line.startswith('[TIME] '):
+					time_line = line
+				elif line.startswith('[SUCCESS]') or line.startswith('[FAIL]') or line.startswith('[BALANCE]'):
+					# 解析狀態與帳號名稱
+					try:
+						status_end = line.index(']')
+						status = line[1:status_end]
+						account = line[status_end + 1 :].strip()
+					except Exception:
+						status = 'INFO'
+						account = line
+
+					# 嘗試解析下一行的餘額與用量
+					bal = '-'
+					used = '-'
+					if i + 1 < len(lines):
+						m = re.search(r'Current balance: \$([0-9.]+), Used: \$([0-9.]+)', lines[i + 1])
+						if m:
+							bal = m.group(1)
+							used = m.group(2)
+
+					rows.append((account, status, bal, used))
+
+			if rows:
+				headers = ('帳號', '狀態', '餘額($)', '已用($)')
+				widths = [len(h) for h in headers]
+				for acc, st, bal, usd in rows:
+					widths[0] = max(widths[0], len(str(acc)))
+					widths[1] = max(widths[1], len(str(st)))
+					widths[2] = max(widths[2], len(str(bal)))
+					widths[3] = max(widths[3], len(str(usd)))
+
+				def fmt(row: tuple[str, str, str, str]) -> str:
+					return (
+						str(row[0]).ljust(widths[0])
+						+ '  '
+						+ str(row[1]).ljust(widths[1])
+						+ '  '
+						+ str(row[2]).rjust(widths[2])
+						+ '  '
+						+ str(row[3]).rjust(widths[3])
+					)
+
+				head = fmt(headers)  # type: ignore[arg-type]
+				body = '\n'.join(fmt(r) for r in rows)
+				prefix = f'{time_line}\n\n' if time_line else ''
+				message = f'<b>{title}</b>\n\n<pre>{prefix}{head}\n{body}</pre>'
 		data = {'chat_id': self.telegram_chat_id, 'text': message, 'parse_mode': 'HTML'}
 		url = f'https://api.telegram.org/bot{self.telegram_bot_token}/sendMessage'
 		with httpx.Client(timeout=30.0) as client:
